@@ -78,6 +78,18 @@ const users = [
     passwordHash: bcrypt.hashSync(process.env.COMERCIAL_PASSWORD, 10),
     role: "analyst",
   },
+  {
+    id: 3,
+    username: process.env.OPERATIVO_USER,
+    passwordHash: bcrypt.hashSync(process.env.OPERATIVO_PASSWORD, 10),
+    role: "sales",
+  },
+  {
+    id: 4,
+    username: process.env.GERENTE_USER,
+    passwordHash: bcrypt.hashSync(process.env.GERENTE_PASSWORD, 10),
+    role: "manager",
+  }
 ];
 
 // ============================
@@ -186,7 +198,7 @@ app.post("/proxy", authenticateJWT, async (req, res) => {
             codigoProducto,
             createdAt: nowEpoch,
             expiresAt,
-            payload: apiData, //  DynamoDB item max 400KB
+            payload: apiData,
           },
         })
       );
@@ -238,7 +250,7 @@ app.post("/enviarCorreo", authenticateJWT, async (req, res) => {
       to: EMAIL_RECIPIENTS,
       subject,
       html,
-      attachments: safeAttachments, // [{ filename, content(base64), contentType }]
+      attachments: safeAttachments,
     });
 
     return res.json({
@@ -257,6 +269,73 @@ app.post("/enviarCorreo", authenticateJWT, async (req, res) => {
     message: "Error enviando correo por Graph",
     details,
   });
+  }
+});
+
+// ============================
+// GUARDAR PRECALIFICACIÓN EN EXCEL
+// ============================
+app.post("/precalificaciones/excel", authenticateJWT, async (req, res) => {
+  try {
+    const usuario = req.user?.username || "unknown";
+
+    const {
+      cedulaDeudor,
+      nombreDeudor,
+      cedulaConyuge,
+      nombreConyuge,
+      scoreDeudor,
+      scoreConyuge,
+      decisionFinal,
+      monto,
+      plazo,
+      cuota,
+      concesionario
+    } = req.body || {};
+
+    if (!cedulaDeudor) {
+      return res.status(400).json({
+        ok: false,
+        message: "Falta cedulaDeudor"
+      });
+    }
+
+    const fecha = new Date().toLocaleString("es-EC");
+
+    const accessToken = await getGraphAppToken();
+
+    await appendRowToExcel(accessToken, [
+      fecha,
+      usuario,
+      String(cedulaDeudor ?? ""),
+      String(nombreDeudor ?? ""),
+      String(cedulaConyuge ?? ""),
+      String(nombreConyuge ?? ""),
+      String(scoreDeudor ?? ""),
+      String(scoreConyuge ?? ""),
+      String(decisionFinal ?? ""),
+      String(monto ?? ""),
+      String(plazo ?? ""),
+      String(cuota ?? ""),
+      String(concesionario ?? "")
+    ]);
+
+    return res.json({
+      ok: true,
+      message: "Precalificación guardada en Excel"
+    });
+
+  } catch (err) {
+    const status = err?.response?.status || 500;
+    const details = err?.response?.data || err?.message || String(err);
+
+    console.error("❌ Error Excel OneDrive:", details);
+
+    return res.status(status).json({
+      ok: false,
+      message: "No se pudo escribir en el Excel",
+      details
+    });
   }
 });
 
