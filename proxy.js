@@ -1,4 +1,4 @@
-// proxy.js (AWS DynamoDB cache 1 mes + Microsoft Graph Mail)
+
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
@@ -8,6 +8,7 @@ require("dotenv").config();
 const { enviarCorreoGraph } = require("./enviarCorreoGraph");
 const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
 const { DynamoDBDocumentClient, GetCommand, PutCommand } = require("@aws-sdk/lib-dynamodb");
+
 const port = process.env.PORT || 3000;
 
 const app = express();
@@ -63,34 +64,112 @@ function buildPk(cedula, codigoProducto) {
 }
 
 // ============================
-// USUARIOS
+// GRAPH + ONEDRIVE (Excel)
 // ============================
-const users = [
-  {
-    id: 1,
-    username: process.env.ADMIN_USER,
-    passwordHash: bcrypt.hashSync(process.env.ADMIN_PASSWORD, 10),
-    role: "admin",
-  },
-  {
-    id: 2,
-    username: process.env.COMERCIAL_USER,
-    passwordHash: bcrypt.hashSync(process.env.COMERCIAL_PASSWORD, 10),
-    role: "analyst",
-  },
-  {
-    id: 3,
-    username: process.env.OPERATIVO_USER,
-    passwordHash: bcrypt.hashSync(process.env.OPERATIVO_PASSWORD, 10),
-    role: "sales",
-  },
-  {
-    id: 4,
-    username: process.env.GERENTE_USER,
-    passwordHash: bcrypt.hashSync(process.env.GERENTE_PASSWORD, 10),
-    role: "manager",
+
+// Obtiene token app-only (client credentials)
+async function getGraphAppToken() {
+  const tenant = process.env.GRAPH_TENANT_ID;
+  const clientId = process.env.GRAPH_CLIENT_ID;
+  const clientSecret = process.env.GRAPH_CLIENT_SECRET;
+
+  if (!tenant || !clientId || !clientSecret) {
+    throw new Error("Faltan GRAPH_TENANT_ID / GRAPH_CLIENT_ID / GRAPH_CLIENT_SECRET en Render");
   }
-];
+
+  const tokenUrl = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
+
+  const params = new URLSearchParams();
+  params.append("client_id", clientId);
+  params.append("client_secret", clientSecret);
+  params.append("scope", "https://graph.microsoft.com/.default");
+  params.append("grant_type", "client_credentials");
+
+  const r = await axios.post(tokenUrl, params.toString(), {
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+  });
+
+  return r.data.access_token;
+}
+
+function base64UrlEncode(str) {
+  return Buffer.from(str)
+    .toString("base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+}
+
+// Resuelve un share URL de OneDrive/SharePoint a driveId/itemId
+async function resolveDriveItemFromShareUrl(accessToken, shareUrl) {
+  const encoded = base64UrlEncode(shareUrl);
+  const url = `https://graph.microsoft.com/v1.0/shares/u!${encoded}/driveItem`;
+
+  const r = await axios.get(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+
+  return {
+    driveId: r.data.parentReference?.driveId,
+    itemId: r.data.id,
+  };
+}
+
+// Agrega una fila a una tabla de Excel (debe existir la tabla)
+async function appendRowToExcel(accessToken, rowValues) {
+  const shareUrl = process.env.ONEDRIVE_EXCEL_SHARE_URL;
+  const tableName = process.env.ONEDRIVE_TABLE_NAME || "tbl_precalificaciones";
+
+  if (!shareUrl) {
+    throw new Error("Falta ONEDRIVE_EXCEL_SHARE_URL en Render");
+  }
+
+  const { driveId, itemId } = await resolveDriveItemFromShareUrl(accessToken, shareUrl);
+
+  if (!driveId || !itemId) {
+    throw new Error("No pude resolver driveId/itemId desde ONEDRIVE_EXCEL_SHARE_URL");
+  }
+
+  const url =
+    `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}` +
+    `/workbook/tables/${tableName}/rows/add`;
+
+  await axios.post(
+    url,
+    { values: [rowValues] },
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+    }
+  );
+}
+
+// ============================
+// USUARIOS 
+// ============================
+
+function buildUser(id, userEnvName, passEnvName, role) {
+  const username = (process.env[userEnvName] || "").toString().trim();
+  const password = (process.env[passEnvName] || "").toString();
+
+  if (!username || !password) return null;
+
+  return {
+    id,
+    username,
+    passwordHash: bcrypt.hashSync(password, 10),
+    role,
+  };
+}
+
+const users = [
+  buildUser(1, "ADMIN_USER", "ADMIN_PASSWORD", "admin"),
+  buildUser(2, "COMERCIAL_USER", "COMERCIAL_PASSWORD", "comercial"),
+  buildUser(3, "OPERATIVO_USER", "OPERATIVO_PASSWORD", "operativo"),
+  buildUser(4, "GERENTE_USER", "GERENTE_PASSWORD", "manager"),
+].filter(Boolean);
 
 // ============================
 // JWT Middleware
@@ -112,6 +191,7 @@ const authenticateJWT = (req, res, next) => {
 // ============================
 app.post("/login", (req, res) => {
   const { username, password } = req.body;
+
   const user = users.find((u) => u.username === username);
 
   if (!user || !bcrypt.compareSync(password, user.passwordHash)) {
@@ -222,11 +302,11 @@ app.post("/proxy", authenticateJWT, async (req, res) => {
 });
 
 // ============================
-// ENVIAR CORREO (MICROSOFT GRAPH) - DESTINATARIOS FIJOS
+// ENVIAR CORREO (GRAPH)
 // ============================
 app.post("/enviarCorreo", authenticateJWT, async (req, res) => {
   try {
-    const { subject, html, attachments } = req.body;
+    const { subject, html, attachments } = req.body || {};
 
     if (!subject || !html) {
       return res.status(400).json({
@@ -250,7 +330,7 @@ app.post("/enviarCorreo", authenticateJWT, async (req, res) => {
       to: EMAIL_RECIPIENTS,
       subject,
       html,
-      attachments: safeAttachments,
+      attachments: safeAttachments, // [{ filename, content(base64), contentType }]
     });
 
     return res.json({
@@ -259,21 +339,21 @@ app.post("/enviarCorreo", authenticateJWT, async (req, res) => {
       recipients: EMAIL_RECIPIENTS,
     });
   } catch (err) {
-  const status = err?.response?.status || 500;
-  const details = err?.response?.data || err?.message || String(err);
+    const status = err?.response?.status || 500;
+    const details = err?.response?.data || err?.message || String(err);
 
-  console.error("Error Graph (detalle):", details);
+    console.error("Error Graph (detalle):", details);
 
-  return res.status(status).json({
-    ok: false,
-    message: "Error enviando correo por Graph",
-    details,
-  });
+    return res.status(status).json({
+      ok: false,
+      message: "Error enviando correo por Graph",
+      details,
+    });
   }
 });
 
 // ============================
-// GUARDAR PRECALIFICACIÓN EN EXCEL
+// GUARDAR PRECALIFICACIÓN EN EXCEL (OneDrive)
 // ============================
 app.post("/precalificaciones/excel", authenticateJWT, async (req, res) => {
   try {
@@ -290,13 +370,13 @@ app.post("/precalificaciones/excel", authenticateJWT, async (req, res) => {
       monto,
       plazo,
       cuota,
-      concesionario
+      concesionario,
     } = req.body || {};
 
     if (!cedulaDeudor) {
       return res.status(400).json({
         ok: false,
-        message: "Falta cedulaDeudor"
+        message: "Falta cedulaDeudor",
       });
     }
 
@@ -317,28 +397,27 @@ app.post("/precalificaciones/excel", authenticateJWT, async (req, res) => {
       String(monto ?? ""),
       String(plazo ?? ""),
       String(cuota ?? ""),
-      String(concesionario ?? "")
+      String(concesionario ?? ""),
     ]);
 
     return res.json({
       ok: true,
-      message: "Precalificación guardada en Excel"
+      message: "Precalificación guardada en Excel",
     });
-
   } catch (err) {
     const status = err?.response?.status || 500;
     const details = err?.response?.data || err?.message || String(err);
 
-    console.error("❌ Error Excel OneDrive:", details);
+    console.error("Error Excel OneDrive (detalle):", details);
 
     return res.status(status).json({
       ok: false,
       message: "No se pudo escribir en el Excel",
-      details
+      details,
     });
   }
 });
 
 app.listen(port, () =>
-  console.log("Servidor backend corriendo en http://localhost:3000")
+  console.log("Servidor backend corriendo en" + port)
 );
