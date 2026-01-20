@@ -7,7 +7,13 @@ const jwt = require("jsonwebtoken");
 require("dotenv").config();
 const { enviarCorreoGraph } = require("./enviarCorreoGraph");
 const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
-const { DynamoDBDocumentClient, GetCommand, PutCommand } = require("@aws-sdk/lib-dynamodb");
+const {
+  DynamoDBDocumentClient,
+  GetCommand,
+  PutCommand,
+  ScanCommand,
+  DeleteCommand,
+} = require("@aws-sdk/lib-dynamodb");
 
 const port = process.env.PORT || 3000;
 
@@ -21,6 +27,12 @@ app.use(express.json());
 const AWS_REGION = process.env.AWS_REGION || "us-east-2";
 const DDB_TABLE = process.env.DDB_TABLE || "aval_cache";
 const CACHE_MONTHS = Number(process.env.CACHE_MONTHS || 1);
+
+// ============================
+// HISTORIAL PRECALIFICACIONES
+// ============================
+const DDB_PRECAL_HISTORY_TABLE = process.env.DDB_PRECAL_HISTORY;
+const PRECAL_HISTORY_MAX = Number(process.env.PRECAL_HISTORY_MAX || 200);
 
 // DESTINATARIOS FIJOS (hardcodeados)
 const EMAIL_RECIPIENTS = [
@@ -61,6 +73,10 @@ function getCedulaFromBody(body) {
 
 function buildPk(cedula, codigoProducto) {
   return `${cedula}#${codigoProducto}`;
+}
+
+function buildHistPk(userId, epochMs = Date.now()) {
+  return `HIST#${userId}#${epochMs}`;
 }
 
 // ============================
@@ -418,6 +434,167 @@ app.post("/precalificaciones/excel", authenticateJWT, async (req, res) => {
   }
 });
 
+// ============================
+// HISTORIAL PRECALIFICACIONES (API)
+// ============================
+
+// Guardar un registro en historial
+app.post("/precalificaciones/historial", authenticateJWT, async (req, res) => {
+  try {
+    const userId = req.user?.userId;
+    const username = req.user?.username || "unknown";
+    if (!userId) return res.status(401).json({ ok: false, message: "No autenticado" });
+
+    const safeBody = req.body && typeof req.body === "object" ? req.body : {};
+    const createdAt = Date.now();
+    const pk = buildHistPk(userId, createdAt);
+
+    await ddb.send(
+      new PutCommand({
+        TableName: DDB_PRECAL_HISTORY_TABLE,
+        Item: {
+          pk,
+          type: "precal_hist",
+          userId: Number(userId),
+          username,
+          createdAt,
+          data: safeBody,
+
+          // ✅ Para consultar por usuario/fecha usando GSI
+          gsi1pk: `USER#${userId}`,
+          gsi1sk: createdAt,
+        },
+      })
+    );
+    if (PRECAL_HISTORY_MAX > 0) {
+      const { Items = [] } = await ddb.send(
+        new QueryCommand({
+          TableName: DDB_PRECAL_HISTORY_TABLE,
+          IndexName: "gsi1",
+          KeyConditionExpression: "gsi1pk = :u",
+          ExpressionAttributeValues: {
+            ":u": `USER#${userId}`,
+          },
+          ScanIndexForward: false, // más nuevas primero
+          ProjectionExpression: "pk, gsi1sk",
+        })
+      );
+
+      if (Items.length > PRECAL_HISTORY_MAX) {
+        const toDelete = Items.slice(PRECAL_HISTORY_MAX);
+
+        for (const it of toDelete) {
+          await ddb.send(
+            new DeleteCommand({
+              TableName: DDB_PRECAL_HISTORY_TABLE,
+              Key: { pk: it.pk },
+            })
+          );
+        }
+      }
+    }
+
+    // ✅ Tu respuesta normal (deja la tuya si ya existe)
+    return res.json({ ok: true, pk, createdAt });
+  } catch (err) {
+    console.error("POST /precalificaciones/historial error:", err);
+    return res.status(500).json({ ok: false, message: "Error guardando historial" });
+  }
+});
+
+
+// Listar historial del usuario
+app.get("/precalificaciones/historial", authenticateJWT, async (req, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ ok: false, message: "No autenticado" });
+
+    const limit = Math.min(Math.max(parseInt(req.query.limit || "50", 10), 1), 200);
+
+    // Nota: Scan + filtro porque la tabla actual no tiene sort key.
+    const scanned = await ddb.send(
+      new ScanCommand({
+        TableName: DDB_PRECAL_HISTORY_TABLE,
+        FilterExpression: "#t = :t AND #u = :u",
+        ExpressionAttributeNames: { "#t": "type", "#u": "userId" },
+        ExpressionAttributeValues: { ":t": "precal_hist", ":u": Number(userId) },
+        Limit: 500,
+      })
+    );
+
+    const items = Array.isArray(scanned?.Items) ? scanned.Items : [];
+    items.sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
+
+    return res.json({ ok: true, items: items.slice(0, limit) });
+  } catch (err) {
+    console.error("Error listando historial:", err?.message || err);
+    return res.status(500).json({ ok: false, message: "No se pudo listar historial" });
+  }
+});
+
+// Eliminar un registro por pk
+app.delete("/precalificaciones/historial/:pk", authenticateJWT, async (req, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ ok: false, message: "No autenticado" });
+
+    const pk = (req.params.pk || "").toString();
+    if (!pk) return res.status(400).json({ ok: false, message: "Falta pk" });
+
+    // Best-effort: borramos. (Como no tenemos Query por PK prefix y la tabla no tiene SK,
+    // asumimos pk exacta enviada desde el frontend.)
+    await ddb.send(
+      new DeleteCommand({
+        TableName: DDB_PRECAL_HISTORY_TABLE,
+        Key: { pk },
+      })
+    );
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Error eliminando historial:", err?.message || err);
+    return res.status(500).json({ ok: false, message: "No se pudo eliminar" });
+  }
+});
+
+// Limpiar TODO el historial del usuario
+app.delete("/precalificaciones/historial", authenticateJWT, async (req, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ ok: false, message: "No autenticado" });
+
+    const scanned = await ddb.send(
+      new ScanCommand({
+        TableName: DDB_PRECAL_HISTORY_TABLE,
+        FilterExpression: "#t = :t AND #u = :u",
+        ExpressionAttributeNames: { "#t": "type", "#u": "userId" },
+        ExpressionAttributeValues: { ":t": "precal_hist", ":u": Number(userId) },
+        Limit: 500,
+      })
+    );
+    const items = Array.isArray(scanned?.Items) ? scanned.Items : [];
+
+    for (const it of items) {
+      if (!it?.pk) continue;
+      try {
+        await ddb.send(
+          new DeleteCommand({
+            TableName: DDB_PRECAL_HISTORY_TABLE,
+            Key: { pk: it.pk },
+          })
+        );
+      } catch (e) {
+        console.warn("No pude borrar pk", it.pk, e?.message || e);
+      }
+    }
+
+    return res.json({ ok: true, deleted: items.length });
+  } catch (err) {
+    console.error("Error limpiando historial:", err?.message || err);
+    return res.status(500).json({ ok: false, message: "No se pudo limpiar" });
+  }
+});
+
 app.listen(port, () =>
-  console.log("Servidor backend corriendo en" + port)
+  console.log("Servidor backend corriendo en" +" "+ port)
 );
