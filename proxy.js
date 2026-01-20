@@ -14,6 +14,8 @@ const {
   ScanCommand,
   DeleteCommand,
 } = require("@aws-sdk/lib-dynamodb");
+const { QueryCommand } = require("@aws-sdk/lib-dynamodb");
+
 
 const port = process.env.PORT || 3000;
 
@@ -509,26 +511,23 @@ app.get("/precalificaciones/historial", authenticateJWT, async (req, res) => {
     const userId = req.user?.userId;
     if (!userId) return res.status(401).json({ ok: false, message: "No autenticado" });
 
-    const limit = Math.min(Math.max(parseInt(req.query.limit || "50", 10), 1), 200);
+    const limit = Math.min(Number(req.query.limit || 50), 200);
 
-    // Nota: Scan + filtro porque la tabla actual no tiene sort key.
-    const scanned = await ddb.send(
-      new ScanCommand({
-        TableName: DDB_PRECAL_HISTORY_TABLE,
-        FilterExpression: "#t = :t AND #u = :u",
-        ExpressionAttributeNames: { "#t": "type", "#u": "userId" },
-        ExpressionAttributeValues: { ":t": "precal_hist", ":u": Number(userId) },
-        Limit: 500,
-      })
-    );
+    const out = await ddb.send(new QueryCommand({
+      TableName: DDB_PRECAL_HISTORY_TABLE,
+      IndexName: "gsi1",
+      KeyConditionExpression: "gsi1pk = :u",
+      ExpressionAttributeValues: {
+        ":u": `USER#${userId}`,
+      },
+      ScanIndexForward: false, // más nuevas primero
+      Limit: limit,
+    }));
 
-    const items = Array.isArray(scanned?.Items) ? scanned.Items : [];
-    items.sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
-
-    return res.json({ ok: true, items: items.slice(0, limit) });
-  } catch (err) {
-    console.error("Error listando historial:", err?.message || err);
-    return res.status(500).json({ ok: false, message: "No se pudo listar historial" });
+    return res.json({ ok: true, items: out.Items || [] });
+  } catch (e) {
+    console.error("Error listando historial:", e);
+    return res.status(500).json({ ok: false, message: "Error listando historial" });
   }
 });
 
