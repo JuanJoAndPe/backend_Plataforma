@@ -463,8 +463,10 @@ app.post("/precalificaciones/historial", authenticateJWT, async (req, res) => {
           data: safeBody,
 
           // ✅ Para consultar por usuario/fecha usando GSI
+          // IMPORTANTE: tu índice gsi1 tiene sort key tipo STRING (S).
+          // Date.now() es Number, así que guardamos como string (13 dígitos) para evitar Type mismatch.
           gsi1pk: `USER#${userId}`,
-          gsi1sk: createdAt,
+          gsi1sk: String(createdAt),
         },
       })
     );
