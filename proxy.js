@@ -148,9 +148,30 @@ async function appendRowToExcel(accessToken, rowValues) {
     throw new Error("No pude resolver driveId/itemId desde ONEDRIVE_EXCEL_SHARE_URL");
   }
 
-  const url =
-    `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}` +
-    `/workbook/tables/${tableName}/rows/add`;
+  const base =
+    `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/workbook`;
+
+  // 1) Validar que la tabla exista (esto evita "parece que no escribe" cuando en realidad es un 404 por tabla mal nombrada)
+  try {
+    const tablesResp = await axios.get(`${base}/tables?$select=name`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+
+    const available = (tablesResp?.data?.value || []).map((t) => t?.name).filter(Boolean);
+    if (available.length && !available.includes(tableName)) {
+      throw new Error(
+        `No existe la tabla "${tableName}" en el Excel. Tablas disponibles: ${available.join(", ")}`
+      );
+    }
+  } catch (e) {
+    // Si Graph no permite listar tablas por permisos, continuamos al intento de add (pero dejamos el detalle del error)
+    // Para debugging real, preferimos fallar con mensaje claro.
+    if (e?.message && String(e.message).includes('No existe la tabla')) throw e;
+    // Si el listado falló por alguna razón, igual intentamos el add (mejor esfuerzo).
+  }
+
+  // 2) Agregar fila a la tabla
+  const url = `${base}/tables/${tableName}/rows/add`;
 
   await axios.post(
     url,
