@@ -40,7 +40,6 @@ const PRECAL_HISTORY_MAX = Number(process.env.PRECAL_HISTORY_MAX || 200);
 const EMAIL_RECIPIENTS = [
   "jandrade@tactiqaec.com",
   "pmantilla@tactiqaec.com",
-  "jhidalgo@tactiqaec.com",
   "dmartinez@tactiqaec.com"
 ];
 
